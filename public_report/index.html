@@ -1,0 +1,381 @@
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>风速预测对比报告</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        /* 使用 Inter 字体 (Tailwind 默认) */
+        body { font-family: 'Inter', sans-serif; }
+        /* 统一下拉菜单样式 */
+        .select-filter {
+            min-width: 80px; 
+            padding: 0.5rem;
+            border-radius: 0.375rem; /* rounded-md */
+            border: 1px solid #D1D5DB; /* gray-300 */
+            background-color: white;
+            box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05); /* shadow-sm */
+            margin-right: 0.5rem; /* mr-2 */
+            margin-bottom: 0.5rem; /* mb-2 */
+        }
+        /* 导航按钮样式 */
+        .nav-btn {
+            padding: 0.5rem 1rem;
+            border: 1px solid transparent;
+            border-radius: 0.375rem; /* rounded-md */
+            font-weight: 500; /* font-medium */
+            color: white;
+            background-color: #3B82F6; /* bg-blue-500 */
+            cursor: pointer;
+            margin: 0 0.25rem; /* mx-1 */
+            margin-bottom: 0.5rem; /* mb-2 */
+        }
+        .nav-btn:hover {
+            background-color: #2563EB; /* bg-blue-600 */
+        }
+        /* 按钮禁用时的样式 */
+        .nav-btn:disabled {
+            background-color: #9CA3AF; /* bg-gray-400 */
+            cursor: not-allowed;
+            opacity: 0.7;
+        }
+        /* 加载动画 */
+        #loading-spinner {
+            display: none; /* 默认隐藏 */
+            margin-left: 1rem; /* ml-4 */
+            width: 1.25rem; /* w-5 */
+            height: 1.25rem; /* h-5 */
+            border-width: 4px;
+            border-color: #3B82F6; /* border-blue-500 */
+            border-style: dashed;
+            border-radius: 9999px; /* rounded-full */
+            animation: spin 1s linear infinite;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen p-4 sm:p-8">
+    <div class="max-w-6xl mx-auto bg-white shadow-lg rounded-lg p-6">
+        <h1 class="text-2xl sm:text-3xl font-bold text-gray-800 mb-6 text-center">风速模型预测与观测对比</h1>
+        
+        <div id="chart-controls" class="mb-6 flex flex-wrap items-center justify-center">
+            <label class="block font-medium text-gray-700 mr-2 mb-2">选择时间:</label>
+            <select id="day-select" class="select-filter"><option>加载中...</option></select>
+            <select id="hour-select" class="select-filter"></select>
+            <select id="minute-select" class="select-filter"></select>
+            <select id="second-select" class="select-filter"></select>
+            
+            <button id="prev-btn" class="nav-btn"> &lt; 上一时刻</button>
+            <button id="next-btn" class="nav-btn">下一时刻 &gt; </button>
+            
+            <div id="loading-spinner"></div>
+        </div>
+        
+        <div class="w-full h-96 sm:h-[500px]">
+            <canvas id="windSpeedChart"></canvas>
+        </div>
+    </div>
+
+    <script>
+        // --- 全局变量 ---
+        let chart; // Chart.js 实例
+        let manifest = {}; // 存储清单
+        let allTimestamps = []; // 存储扁平的时间戳列表
+        let currentTimestampIndex = -1; // 当前在 allTimestamps 列表中的索引
+        const labels = Array.from({ length: 14 }, (_, i) => `+${i + 1}s`);
+
+        // DOM 元素引用
+        const daySelect = document.getElementById('day-select');
+        const hourSelect = document.getElementById('hour-select');
+        const minuteSelect = document.getElementById('minute-select');
+        const secondSelect = document.getElementById('second-select');
+        const prevBtn = document.getElementById('prev-btn');
+        const nextBtn = document.getElementById('next-btn');
+        const loadingSpinner = document.getElementById('loading-spinner');
+
+        // --- 辅助函数 ---
+
+        /**
+         * 显示或隐藏加载动画
+         * @param {boolean} isLoading - 是否显示
+         */
+        function showLoading(isLoading) {
+            loadingSpinner.style.display = isLoading ? 'block' : 'none';
+        }
+
+        /**
+         * 填充下拉框
+         * @param {HTMLSelectElement} selectEl - 下拉框元素
+         * @param {string[]} options - 选项数组 (字符串)
+         * @param {string} [suffix=''] - 选项文本后缀 (例如 '时')
+         */
+        function populateSelect(selectEl, options, suffix = '') {
+            const currentVal = selectEl.value;
+            selectEl.innerHTML = ''; // 清空旧选项
+            options.forEach(option => {
+                const optionEl = document.createElement('option');
+                optionEl.value = option;
+                optionEl.textContent = `${option}${suffix}`;
+                selectEl.appendChild(optionEl);
+            });
+            // 尝试保持之前选中的值
+            if (options.includes(currentVal)) {
+                selectEl.value = currentVal;
+            }
+        }
+
+        /**
+         * 更新导航按钮（上一/下一）的状态
+         * @param {number} index - 当前在 allTimestamps 中的索引
+         */
+        function updateButtonState(index) {
+            currentTimestampIndex = index;
+            prevBtn.disabled = (index <= 0);
+            nextBtn.disabled = (index >= allTimestamps.length - 1);
+        }
+
+        // --- 核心数据加载与绘图 ---
+
+        /**
+         * 最终绘图函数：根据路径获取单个JSON文件并绘制
+         * @param {string} day
+         * @param {string} hour
+         * @param {string} minute
+         * @param {string} second
+         */
+        async function fetchAndDrawChart(day, hour, minute, second) {
+            showLoading(true);
+            // 确保所有部分都是有效的字符串
+            if (!day || !hour || !minute || !second) {
+                console.warn("绘图调用缺少参数:", day, hour, minute, second);
+                if (chart) { chart.destroy(); } // 清空图表
+                updateButtonState(-1); // 禁用按钮
+                showLoading(false);
+                return;
+            }
+            
+            const dataPath = `./data/timeseries/${day}/${hour}/${minute}/${second}.json`;
+            
+            try {
+                const response = await fetch(dataPath);
+                if (!response.ok) {
+                    throw new Error(`网络错误: ${response.statusText} (路径: ${dataPath})`);
+                }
+                const data = await response.json();
+                
+                // 绘制
+                const ctx = document.getElementById('windSpeedChart').getContext('2d');
+                if (chart) { chart.destroy(); } // 销毁旧图表
+                
+                chart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [
+                            { 
+                                label: '观测值 (True)', 
+                                data: data.trueValues, 
+                                borderColor: 'rgb(59, 130, 246)', 
+                                backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                                fill: false, 
+                                tension: 0.1
+                            },
+                            { 
+                                label: '预测值 (Pred)', 
+                                data: data.predValues, 
+                                borderColor: 'rgb(239, 68, 68)', 
+                                backgroundColor: 'rgba(239, 68, 68, 0.1)',
+                                fill: false, 
+                                tension: 0.1
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: { position: 'top' },
+                            title: { 
+                                display: true, 
+                                text: `预测起始时间: ${data.timestamp}`,
+                                font: { size: 16 }
+                            }
+                        },
+                        scales: {
+                            x: { title: { display: true, text: '预测未来时间 (s)' } },
+                            y: { title: { display: true, text: '风速' } }
+                        }
+                    }
+                });
+                
+                // 找到这个时间戳在扁平列表中的索引，并更新按钮
+                const flatIndex = allTimestamps.findIndex(t => 
+                    t.day === day && t.hour === hour && t.minute === minute && t.second === second
+                );
+                
+                if (flatIndex !== -1) {
+                    updateButtonState(flatIndex);
+                } else {
+                    console.warn("未能在扁平列表中找到索引:", data.timestamp);
+                    updateButtonState(-1); // 找不到，禁用按钮
+                }
+                
+            } catch (error) {
+                console.error("加载或绘制图表失败:", error);
+                if (chart) { chart.destroy(); } // 清空图表
+            } finally {
+                showLoading(false);
+            }
+        }
+
+        // --- 级联下拉框更新 ---
+
+        function updateHourOptions() {
+            const day = daySelect.value;
+            const hours = Object.keys(manifest.tree[day] || {}).sort();
+            populateSelect(hourSelect, hours, '时');
+            updateMinuteOptions();
+        }
+
+        function updateMinuteOptions() {
+            const day = daySelect.value;
+            const hour = hourSelect.value;
+            const minutes = Object.keys(manifest.tree[day]?.[hour] || {}).sort();
+            populateSelect(minuteSelect, minutes, '分');
+            updateSecondOptions();
+        }
+
+        function updateSecondOptions() {
+            const day = daySelect.value;
+            const hour = hourSelect.value;
+            const minute = minuteSelect.value;
+            const seconds = (manifest.tree[day]?.[hour]?.[minute] || []).sort();
+            populateSelect(secondSelect, seconds, '秒');
+            
+            // 自动绘制第一个可用的秒
+            if (seconds.length > 0) {
+                // 确保value被选中
+                secondSelect.value = seconds[0];
+                fetchAndDrawChart(day, hour, minute, secondSelect.value);
+            } else {
+                // 没有数据，清空图表
+                if (chart) { chart.destroy(); }
+                updateButtonState(-1); // 禁用按钮
+            }
+        }
+
+        // --- 导航按钮 ---
+
+        /**
+         * 通过扁平索引跳转到特定时间戳
+         * @param {number} index - 在 allTimestamps 数组中的索引
+         */
+        function navigateToTimestamp(index) {
+            if (index < 0 || index >= allTimestamps.length) return;
+            
+            const tsInfo = allTimestamps[index];
+            
+            // 检查并更新下拉框的值
+            // (我们必须先更新下拉框，再触发下一级的填充，
+            // 否则下一级可能没有正确的选项)
+            
+            let needsHourUpdate = false;
+            let needsMinuteUpdate = false;
+            let needsSecondUpdate = false;
+            
+            if (daySelect.value !== tsInfo.day) {
+                daySelect.value = tsInfo.day;
+                needsHourUpdate = true;
+            }
+            
+            if (needsHourUpdate) {
+                const hours = Object.keys(manifest.tree[tsInfo.day] || {}).sort();
+                populateSelect(hourSelect, hours, '时');
+            }
+            
+            if (hourSelect.value !== tsInfo.hour || needsHourUpdate) {
+                hourSelect.value = tsInfo.hour;
+                needsMinuteUpdate = true;
+            }
+
+            if (needsMinuteUpdate) {
+                const minutes = Object.keys(manifest.tree[tsInfo.day]?.[tsInfo.hour] || {}).sort();
+                populateSelect(minuteSelect, minutes, '分');
+            }
+            
+            if (minuteSelect.value !== tsInfo.minute || needsMinuteUpdate) {
+                minuteSelect.value = tsInfo.minute;
+                needsSecondUpdate = true;
+            }
+
+            if (needsSecondUpdate) {
+                const seconds = (manifest.tree[tsInfo.day]?.[tsInfo.hour]?.[tsInfo.minute] || []).sort();
+                populateSelect(secondSelect, seconds, '秒');
+            }
+
+            secondSelect.value = tsInfo.second;
+            
+            // 最终调用绘图
+            fetchAndDrawChart(tsInfo.day, tsInfo.hour, tsInfo.minute, tsInfo.second);
+        }
+
+        // --- 页面初始化 ---
+        window.onload = async function() {
+            showLoading(true);
+            try {
+                // 关键：加载清单文件
+                const response = await fetch('./data/manifest.json');
+                if (!response.ok) { throw new Error('清单文件(manifest.json)加载失败'); }
+                manifest = await response.json();
+                
+                if (!manifest.tree || !manifest.timestamps) {
+                     throw new Error('清单文件格式不正确。');
+                }
+                
+                allTimestamps = manifest.timestamps || [];
+                
+                // 1. 填充"日"下拉框
+                const days = Object.keys(manifest.tree).sort();
+                populateSelect(daySelect, days, '');
+                
+                // 2. 绑定事件
+                daySelect.addEventListener('change', updateHourOptions);
+                hourSelect.addEventListener('change', updateMinuteOptions);
+                minuteSelect.addEventListener('change', updateSecondOptions);
+                secondSelect.addEventListener('change', (e) => {
+                    fetchAndDrawChart(daySelect.value, hourSelect.value, minuteSelect.value, e.target.value);
+                });
+                
+                prevBtn.addEventListener('click', () => {
+                    if (currentTimestampIndex > 0) {
+                        navigateToTimestamp(currentTimestampIndex - 1);
+                    }
+                });
+                
+                nextBtn.addEventListener('click', () => {
+                    if (currentTimestampIndex < allTimestamps.length - 1) {
+                        navigateToTimestamp(currentTimestampIndex + 1);
+                    }
+                });
+
+                // 3. 触发第一次级联更新并自动绘制
+                if (days.length > 0) {
+                    updateHourOptions(); // 这将触发一个级联调用，最终绘制图表
+                } else {
+                    daySelect.innerHTML = '<option>无数据</option>';
+                    showLoading(false);
+                }
+
+            } catch (error) {
+                console.error("初始化失败:", error);
+                daySelect.innerHTML = '<option>加载失败</option>';
+                showLoading(false);
+            }
+            // 初始加载完成后，无论成功失败都应隐藏
+            showLoading(false);
+        };
+    </script>
+</body>
+</html>
